@@ -480,19 +480,29 @@ void check_sensores(void){
     // Solo permitimos que el potenciómetro cambie el brillo si NO estamos en Config
     // En Config, mandan los botones.
     if (estadoActual != ESTADO_MODO_CONFIG) {
-        brilloDisplay = lectura_potenciometro;
+        if (abs(lectura_potenciometro - brilloDisplay) > 1) {
+            brilloDisplay = lectura_potenciometro;
+        }
     }
 
-    // Aplicar cambios al PWM si hay variación (ya sea por botones o potenciómetro)
-    if ( abs(brilloDisplay - ultimoBrillo) > 2 ) {
+    if ( brilloDisplay != ultimoBrillo ) { // Simplificado: si es distinto, actualizamos.
+        
+        // Saturación de seguridad (0 a 100)
+        if (brilloDisplay > 100) brilloDisplay = 100;
+        if (brilloDisplay < 0) brilloDisplay = 0;
+
         brilloTFT = brilloDisplay;
-        LPC_PWM1->MR6 = (LPC_PWM1->MR0 * brilloTFT) / 100; // Corrección cálculo float
+        
+        // Actualización de registro PWM
+        LPC_PWM1->MR6 = (LPC_PWM1->MR0 * brilloTFT) / 100;
         LPC_PWM1->LER |= (1<<6); 
+        
         ultimoBrillo = brilloDisplay;
         
-        // Si estamos en config, actualizamos el texto (los botones lo habrán cambiado)
+        // Si estamos en config, refrescamos el texto numérico del brillo
         if (estadoActual == ESTADO_MODO_CONFIG) {
-            sprintf(texto_nuevo, "Brillo: %3d%%     ", brilloDisplay);
+            sprintf(texto_nuevo, "Brillo: %3d%%      ", brilloDisplay);
+            // Solo redibujamos si el texto cambia realmente
             if (strcmp(texto_nuevo, texto_brillo_anterior) != 0) {
                 disable_critical_irqs();
                 escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto_nuevo, Black, White);
@@ -609,9 +619,7 @@ int main(void) {
         if ( (ms_ticks - last_sensor_check) >= T_REFRESCO_SENSORES_MS ) {
             last_sensor_check = ms_ticks;
             
-            if (estadoActual == ESTADO_MODO_NORMAL || estadoActual == ESTADO_MODO_CONFIG) {
-                check_sensores(); 
-            }
+            check_sensores();
             
             if (leer_KEY1()) {
                 audioHabilitado = !audioHabilitado;
