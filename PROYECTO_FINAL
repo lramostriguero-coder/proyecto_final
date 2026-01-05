@@ -13,10 +13,13 @@
 #include <stdlib.h>
 #include <math.h>
 #include "uart.h" /* Librería RFID */
+#include <TCS34725.h>
 
-// Reducimos las muestras a 12000 (1.5s) para asegurar que caben 2 buffers en RAM
+
+
 #define F_sample 8000
-#define N_muestras 16000 
+#define N_muestras 12000 
+#define UMBRAL_DETECCION 40  
 
 /* --- DEFINICIONES DE TIMING --- */
 #define T_REFRESCO_SENSORES_MS  200
@@ -61,9 +64,16 @@ typedef enum {
     ACTUALIZAR_DISPLAY
 } EstadosRFID;
 
+
 typedef enum { EDIT_NONE, EDIT_YEAR, EDIT_MONTH, EDIT_DOM, EDIT_HOUR, EDIT_MIN } t_EditParam;
 
 /* --- VARIABLES GLOBALES --- */
+
+const uint8_t TAG_REF[2][3] = {
+    {112, 62, 72},  // TAG 1: Rosa
+    {53, 122, 61}     // TAG 2: Verde clarito
+};
+
 volatile uint8_t lcd_ocupado = 0; 
 
 t_EstadoSistema estadoActual = ESTADO_MENU_PRINCIPAL;
@@ -115,6 +125,12 @@ volatile uint8_t *ptr_audio_activo = audio_verde;
 volatile uint16_t indice_muestra;
 volatile uint8_t estado_sistema = 0; // 0=IDLE, 1=REPRODUCIENDO, 2=GRABANDO
 volatile uint8_t grabacion_completa = 0; // Semáforo de fin de grabación
+
+// Variables para la lógica de color
+uint16_t raw_r, raw_g, raw_b, raw_c;
+uint8_t final_r, final_g, final_b;
+uint8_t ultimo_tag_detectado = 0;
+uint8_t flag_objeto_presente = 0; // Para evitar contar el mismo objeto 1000 veces
 
 // Buffers para evitar parpadeos
 char texto_temp_anterior[40] = "";
@@ -397,7 +413,7 @@ void mostrarSubMenuColor(char* titulo, uint16_t color) {
     squareButton(&zone_titulo, titulo, Black, color);
     
     // Instrucciones para los botones físicos
-    GUI_Text(20, 60, (uint8_t*)"USE BOTONES PLACA:", Black, White);
+    GUI_Text(20, 60, (uint8_t*)"USE BOTONES:", Black, White);
     GUI_Text(20, 90, (uint8_t*)"KEY2: GRABAR", Red, White);
     GUI_Text(20, 120, (uint8_t*)"KEY1: REPRODUCIR", Blue, White);
     
@@ -630,6 +646,107 @@ void EINT2_IRQHandler(void) { // GRABAR (KEY2)
     if (estado_sistema == 0) iniciar_grabacion_color(ptr_audio_activo);
 }
 
+
+/* --- FUNCIONES DE COLOR --- */
+
+uint8_t saturar_valor(uint32_t valor) {
+    if (valor > 255) return 255;
+    return (uint8_t)valor;
+}
+
+uint8_t identificarTag(uint8_t r, uint8_t g, uint8_t b) {
+    int i;
+    int32_t diff;
+    int32_t min_diff = 10000; 
+    uint8_t id_detectado = 0;
+
+    // Filtro de oscuridad (si hay poca luz, ignorar)
+    if (r < 20 && g < 20 && b < 20) return 0;
+
+    for(i = 0; i < 2; i++) {
+        // Distancia Manhattan
+        int dr = abs((int)r - (int)TAG_REF[i][0]);
+        int dg = abs((int)g - (int)TAG_REF[i][1]);
+        int db = abs((int)b - (int)TAG_REF[i][2]);
+        
+        diff = dr + dg + db;
+
+        if (diff < min_diff) {
+            min_diff = diff;
+            if (diff < UMBRAL_DETECCION) {
+                id_detectado = i + 1; // 1:Rosa, 2:Verde
+            }
+        }
+    }
+    return id_detectado;
+}
+
+void procesar_sensor_color(void) {
+    uint32_t temp_r, temp_g, temp_b;
+    uint8_t tag_actual;
+    
+
+    // 1. Leer Sensor (Usando nuestro driver TCS34725.h)
+    TCS34725_getRawData(&raw_r, &raw_g, &raw_b, &raw_c);
+
+    // 2. Normalizar (Escalado simple basado en el canal Clear)
+    if (raw_c > 0) {
+        // Hacemos un escalado proporcional para llevarlo a 0-255
+        // (Valor / Clear) * 255 es una técnica común para normalizar brillo
+        temp_r = (raw_r * 255) / raw_c;
+        temp_g = (raw_g * 255) / raw_c;
+        temp_b = (raw_b * 255) / raw_c;
+        
+        // Aplicamos un factor de ganancia extra si está muy oscuro, o saturamos directamente
+        // Para simplificar, usamos tu lógica de saturación directa sobre el valor raw si no normalizas por Clear
+        // Pero lo ideal es normalizar. Usaremos tu lógica directa si prefieres:
+        /* Tu lógica original: */
+        final_r = saturar_valor(temp_r); // Ojo: raw_r suele ser > 255 con ganancia 4x o 16x
+        final_g = saturar_valor(temp_g);
+        final_b = saturar_valor(temp_b);
+    } else {
+        final_r = 0; final_g = 0; final_b = 0;
+    }
+
+    // 3. Identificar
+    tag_actual = identificarTag(final_r, final_g, final_b);
+
+		
+		if (estadoActual == ESTADO_MODO_NORMAL) {
+    char txt_debug[40];
+    sprintf(txt_debug, "R:%03d G:%03d B:%03d   ", final_r, final_g, final_b);
+    disable_critical_irqs();
+    // Escribimos abajo del todo para no molestar
+    GUI_Text(10, 260, (uint8_t*)txt_debug, Black, White); 
+    enable_critical_irqs();
+}
+		
+    // 4. Lógica de Conteo (Máquina de estados simple)
+    if (tag_actual != 0 && flag_objeto_presente == 0) {
+        // ¡Nuevo objeto detectado!
+        flag_objeto_presente = 1; // Bloqueamos para no contar más veces este objeto
+        ultimo_tag_detectado = tag_actual;
+
+        if (tag_actual == 1) { // Rosa
+            contRosa++;
+            // Aquí podrías activar servo para Rosa
+        } 
+        else if (tag_actual == 2) { // Verde
+            contVerde++;
+            // Aquí podrías activar servo para Verde
+        }
+        
+        // Actualizar pantalla si estamos en Modo Normal
+        if (estadoActual == ESTADO_MODO_NORMAL) {
+             mostrarModoNormal(); // Refresca contadores
+        }
+    } 
+    else if (tag_actual == 0) {
+        // El objeto se ha ido (o no hay nada)
+        flag_objeto_presente = 0;
+    }
+}
+
 /* --- MAIN LOOP --- */
 int main(void) {
     int j;
@@ -642,9 +759,11 @@ int main(void) {
     // Inicialización periféricos
     init_RTC();
     configPWM();
-    init_Externas(); // ¡FALTABA!
+    init_Externas(); 
     init_ADC();      
-    init_DAC();      // ¡FALTABA!
+    init_DAC();     
+		TCS34725_init();
+		TCS34725_enable();
     init_TIMER1(); 
     init_TIMER2(); 
     init_TIMER3(); 
@@ -674,8 +793,14 @@ int main(void) {
         // 1. GESTIÓN SENSORES
         if ( (ms_ticks - last_sensor_check) >= T_REFRESCO_SENSORES_MS ) {
             last_sensor_check = ms_ticks;
-            check_sensores();
-            if (leer_KEY1()) { audioHabilitado = !audioHabilitado; if (estadoActual == ESTADO_MODO_NORMAL) mostrarModoNormal(); }
+            
+            check_sensores();        // Temperatura y Potenciómetro
+            procesar_sensor_color(); // rgb
+            
+            if (leer_KEY1()) { 
+                audioHabilitado = !audioHabilitado; 
+                if (estadoActual == ESTADO_MODO_NORMAL) mostrarModoNormal();
+            }
         }
         
         // 2. GESTIÓN TÁCTIL
