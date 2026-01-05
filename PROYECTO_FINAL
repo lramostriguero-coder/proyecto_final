@@ -1,8 +1,8 @@
 /********************************************************************************
- * PROYECTO: Sistema de Control SEDA - Gestión de RTC y Teclado Táctil
+ * PROYECTO: Sistema de Control SEDA - Gestión de RTC, Teclado Táctil y RFID
  * DISPOSITIVO: NXP LPC1768
  * PROFESOR: LAB SEDA
- * SOLUCIÓN: Protección atómica (__disable_irq) para evitar corrupción en GLCD
+ * SOLUCIÓN: Integración de RFID sobre base estable con protección atómica
  ********************************************************************************/
 
 #include <LPC17xx.H>
@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "uart.h" /* Librería RFID */
 
 /* --- DEFINICIONES DE TIMING --- */
 #define T_REFRESCO_SENSORES_MS  200
@@ -44,8 +45,15 @@ typedef enum {
     ESTADO_MODO_NORMAL, 
     ESTADO_MODO_CONFIG,
     ESTADO_AJUSTE_RTC,         
-    ESTADO_TECLADO          
+    ESTADO_TECLADO           
 } t_EstadoSistema;
+
+typedef enum {
+    ESPERA_TRAMA,
+    VALIDAR_CABECERA,
+    EXTRAER_DATOS,
+    ACTUALIZAR_DISPLAY
+} EstadosRFID;
 
 typedef enum { EDIT_NONE, EDIT_YEAR, EDIT_MONTH, EDIT_DOM, EDIT_HOUR, EDIT_MIN } t_EditParam;
 
@@ -67,13 +75,13 @@ int ultimaTemp = -1;
 int ultimoServo = -1;
 float milivoltios = 0;
 float brilloTFT = 0;
-uint32_t canal_0, canal_1;
+volatile uint32_t canal_0, canal_1;
 
 uint8_t  pressedTouchPanel = 0;
 
 int anguloServo = 90;   
 int umbralTemperatura = 0;
-int brilloDisplay = 50;           
+int brilloDisplay = 50;            
 char texto[40];
 char texto_reloj_nuevo[40]; 
 
@@ -82,6 +90,12 @@ char keypadBuffer[6];
 uint8_t  bufferIdx = 0;
 
 volatile uint8_t  flag_toggle_config = 0;
+
+/* --- VARIABLES PARA GESTIÓN RFID --- */
+uint8_t rfid_raw_data[5];       // Almacena los 5 bytes de datos del tag
+char rfid_string_display[13] = "---"; // Cadena para mostrar en pantalla
+int k_rfid = 0; // Variable auxiliar para bucles
+EstadosRFID estado_rfid = ESPERA_TRAMA;
 
 // Buffers para evitar parpadeos
 char texto_temp_anterior[40] = "";
@@ -116,11 +130,11 @@ struct t_screenZone keys[12];
 // mientras dibujamos. Esto evita que el barrido de la pantalla se corrompa.
 void disable_critical_irqs(void) {
     __disable_irq();  // Apaga interrupciones a nivel CPU
-    lcd_ocupado = 1;              
+    lcd_ocupado = 1;               
 }
 
 void enable_critical_irqs(void) {
-    lcd_ocupado = 0;              
+    lcd_ocupado = 0;               
     __enable_irq();   // Reactiva interrupciones
 }
 
@@ -320,8 +334,10 @@ void mostrarModoNormal(void) {
     
     texto_temp_anterior[0] = '\0'; 
     
+    /* --- INTEGRACIÓN RFID --- */
+    sprintf(texto, "RFID: %s      ", rfid_string_display);
     disable_critical_irqs();
-    GUI_Text(30, 115, (uint8_t*)"RFID: 8A4F2C (E)", Black, White);
+    GUI_Text(30, 115, (uint8_t*)texto, Black, White);
     LCD_DrawLine(10, 145, 230, 145, Blue);
     GUI_Text(20, 155, (uint8_t*)"OBJETOS PROCESADOS:", Blue, White);
     enable_critical_irqs();
@@ -430,7 +446,7 @@ void configPWM(void) {
     LPC_PWM1->MR6 = (LPC_PWM1->MR0 * brilloDisplay) / 100; 
     LPC_PWM1->LER |= (1<<0) | (1<<6);
     LPC_PWM1->PCR |= (1<<14);         
-    LPC_PWM1->TCR |= (1<<0) | (1<<3);             
+    LPC_PWM1->TCR |= (1<<0) | (1<<3);               
 }
 
 void checkTouchPanel(void) {
@@ -611,10 +627,67 @@ int main(void) {
     init_TIMER2();  
     SysTick_config();
     
+    /* --- INICIALIZACIÓN RFID --- */
+    uart3_init(9600); // Inicializa UART3 a 9600 baudios
+    ptr_rx = buffer;  // Apunta el puntero de recepción al inicio del buffer
+    
     mostrarMenuPrincipal();
         
     while(1) {
         
+        /* --- MÁQUINA DE ESTADOS RFID --- */
+        switch(estado_rfid) {
+            case ESPERA_TRAMA:
+                if(rx_completa == 1) { // rx_completa se activa en uart.c (ISR)
+                    rx_completa = 0; 
+                    estado_rfid = VALIDAR_CABECERA;
+                }
+                break;
+
+            case VALIDAR_CABECERA:
+                // Protocolo RFID 125kHz típico empieza con 0x02
+                if(buffer[0] == 0x02) {
+                    estado_rfid = EXTRAER_DATOS;
+                } else {
+                    ptr_rx = buffer; // Trama inválida, reset
+                    estado_rfid = ESPERA_TRAMA;
+                }
+                break;
+
+            case EXTRAER_DATOS:
+                // Suponemos trama acabada en NULL o ETX
+                // Ajustar índice según longitud real de tu tag
+                if(buffer[9] == 0x00) { 
+                    // Extraer 5 bytes de ID (ej: saltando cabecera de 3 bytes)
+                    // Ajustar offset según tu lector específico
+                    for(k_rfid=0; k_rfid<5; k_rfid++){
+                        rfid_raw_data[k_rfid] = buffer[3+k_rfid];
+                    }
+                    estado_rfid = ACTUALIZAR_DISPLAY;
+                } else {
+                    ptr_rx = buffer;
+                    estado_rfid = ESPERA_TRAMA;
+                }
+                break;
+
+            case ACTUALIZAR_DISPLAY:
+                sprintf(rfid_string_display, "%02X%02X%02X%02X%02X", 
+                        rfid_raw_data[0], rfid_raw_data[1], rfid_raw_data[2], 
+                        rfid_raw_data[3], rfid_raw_data[4]);
+                
+                // Actualizar pantalla solo si estamos en modo normal
+                if (estadoActual == ESTADO_MODO_NORMAL) {
+                    disable_critical_irqs();
+                    sprintf(texto, "RFID: %s      ", rfid_string_display);
+                    escribirTextoDinamico(30, 115, texto, Black, White);
+                    enable_critical_irqs();
+                }
+                
+                ptr_rx = buffer; // Reset para siguiente lectura
+                estado_rfid = ESPERA_TRAMA;
+                break;
+        }
+
         // 1. GESTIÓN DE SENSORES (cada 200ms)
         if ( (ms_ticks - last_sensor_check) >= T_REFRESCO_SENSORES_MS ) {
             last_sensor_check = ms_ticks;
@@ -723,3 +796,19 @@ int main(void) {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
