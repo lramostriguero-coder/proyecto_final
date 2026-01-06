@@ -42,7 +42,7 @@
 #define PIN_IR_NARANJA     (1 << 24) // P1.24
 
 /* --- DEFINICIONES SERVOS (TIMER0) --- */
-float TH_min = 0.4e-3;
+float TH_min = 0.5e-3;
 float TH_max = 2.4e-3;
 #define T_pwm 15e-3
 #define T_PWM_MS_SERVO 20.0
@@ -99,8 +99,8 @@ typedef struct {
 t_ControlServo servoVerde = {SERVO_IDLE, 0, 0};
 t_ControlServo servoNaranja  = {SERVO_IDLE, 0, 1};
 
-float TH0 = 0.4e-3;
-float TH1 = 0.4e-3;
+float TH0 = 0.5e-3;
+float TH1 = 0.5e-3;
 
 volatile uint8_t lcd_ocupado = 0; 
 volatile uint8_t update_audio_ui = 0;
@@ -801,7 +801,7 @@ void procesar_sensor_color(void) {
 /* --- INICIALIZACIÓN DE SENSORES IR --- */
 void init_IR_Sensores(void) {
     LPC_PINCON->PINSEL3 &= ~((3UL << 14) | (3UL << 16));
-    LPC_GPIO0->FIODIR &= ~(PIN_IR_VERDE | PIN_IR_NARANJA);
+    LPC_GPIO1->FIODIR &= ~(PIN_IR_VERDE | PIN_IR_NARANJA);
     LPC_PINCON->PINMODE3 &= ~((3UL << 14) | (3UL << 16));
 }
 
