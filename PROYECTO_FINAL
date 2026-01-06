@@ -1,8 +1,6 @@
 /********************************************************************************
- * PROYECTO: Sistema de Control SEDA - Gestión de RTC, Teclado Táctil y RFID
+ * PROYECTO: Sistema de Control SEDA 
  * DISPOSITIVO: NXP LPC1768
- * PROFESOR: LAB SEDA
- * SOLUCIÓN: Integración completa con Audio Multicanal (Verde/Rosa)
  ********************************************************************************/
 
 #include <LPC17xx.H>
@@ -38,7 +36,10 @@
 #define CLKEN 0                         
 #define RTCIF 0                         
 #define IMSEC 0                         
-#define CCALEN 4                        
+#define CCALEN 4  
+
+#define PIN_IR_VERDE    (1 << 14) // P1.14
+#define PIN_IR_ROSA     (1 << 15) // P1.15
 
 /* --- ESTRUCTURAS Y TIPOS --- */
 struct t_screenZone {
@@ -75,6 +76,7 @@ const uint8_t TAG_REF[2][3] = {
 };
 
 volatile uint8_t lcd_ocupado = 0; 
+volatile uint8_t update_audio_ui = 0; // flag para actualizar interfaz solo cuando cambie el estado
 
 t_EstadoSistema estadoActual = ESTADO_MENU_PRINCIPAL;
 t_EditParam parametroAEditar = EDIT_NONE;
@@ -343,6 +345,11 @@ void mostrarModoNormal(void) {
     disable_critical_irqs(); GUI_Text(30, 115, (uint8_t*)texto, Black, White);
     LCD_DrawLine(10, 145, 230, 145, Blue);
     GUI_Text(20, 155, (uint8_t*)"OBJETOS PROCESADOS:", Blue, White); enable_critical_irqs();
+//		sprintf(texto, "ADC RAW: %4d   ", canal_0); 
+//		GUI_Text(20, 155, (uint8_t*)texto, Red, White); 
+// -------------------------------
+
+LCD_DrawLine(10, 145, 230, 145, Blue);
     
     sprintf(texto, "VERDES: %d  ", contVerde);
     disable_critical_irqs(); GUI_Text(40, 175, (uint8_t*)texto, Green, White); enable_critical_irqs();
@@ -634,10 +641,34 @@ void init_Externas() {
     LPC_PINCON->PINSEL4 |= (1<<24); LPC_SC->EXTMODE |= (1<<2); LPC_SC->EXTPOLAR &= ~(1<<2); NVIC_EnableIRQ(EINT2_IRQn);
 }
 
-void EINT1_IRQHandler() { // REPRODUCIR (KEY1)
-    LPC_SC->EXTINT = (1<<1);
-    // Reproduce el color que esté seleccionado actualmente
-    if (estado_sistema == 0) iniciar_reproduccion_color(ptr_audio_activo);
+void EINT1_IRQHandler(void) {
+    // 1. Limpiar flag de interrupción inmediatamente
+    LPC_SC->EXTINT |= (1 << 1); 
+
+    // 2. Debouncing básico por software (Opcional si tienes mucho rebote)
+    // Se puede usar un timer, pero para simplificar aquí, asumiremos que el hardware ayuda.
+    
+    // 3. Lógica según el Estado del Sistema
+    switch(estadoActual) {
+        case ESTADO_MODO_NORMAL:
+            // En modo normal: KEY1 activa/desactiva el permiso de audio
+            audioHabilitado = !audioHabilitado;
+            update_audio_ui = 1; // Avisamos al main para que pinte el icono
+            break;
+
+        case ESTADO_CONFIG_VERDE:
+        case ESTADO_CONFIG_ROSA:
+            // En menús de configuración: KEY1 reproduce la grabación actual
+            // Solo si el sistema de audio está libre (IDLE)
+            if (estado_sistema == 0) {
+                iniciar_reproduccion_color(ptr_audio_activo);
+            }
+            break;
+
+        default:
+            // En otros menús (Principal, RTC...) KEY1 no hace nada
+            break;
+    }
 }
 
 void EINT2_IRQHandler(void) { // GRABAR (KEY2)
@@ -682,69 +713,74 @@ uint8_t identificarTag(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void procesar_sensor_color(void) {
-    uint32_t temp_r, temp_g, temp_b;
-    uint8_t tag_actual;
-    
-
-    // 1. Leer Sensor (Usando nuestro driver TCS34725.h)
+    uint32_t temp_r, temp_g, temp_b; uint8_t tag_actual;
     TCS34725_getRawData(&raw_r, &raw_g, &raw_b, &raw_c);
-
-    // 2. Normalizar (Escalado simple basado en el canal Clear)
+    
     if (raw_c > 0) {
-        // Hacemos un escalado proporcional para llevarlo a 0-255
-        // (Valor / Clear) * 255 es una técnica común para normalizar brillo
-        temp_r = (raw_r * 255) / raw_c;
-        temp_g = (raw_g * 255) / raw_c;
-        temp_b = (raw_b * 255) / raw_c;
-        
-        // Aplicamos un factor de ganancia extra si está muy oscuro, o saturamos directamente
-        // Para simplificar, usamos tu lógica de saturación directa sobre el valor raw si no normalizas por Clear
-        // Pero lo ideal es normalizar. Usaremos tu lógica directa si prefieres:
-        /* Tu lógica original: */
-        final_r = saturar_valor(temp_r); // Ojo: raw_r suele ser > 255 con ganancia 4x o 16x
-        final_g = saturar_valor(temp_g);
-        final_b = saturar_valor(temp_b);
-    } else {
-        final_r = 0; final_g = 0; final_b = 0;
-    }
+        temp_r = (raw_r * 255) / raw_c; temp_g = (raw_g * 255) / raw_c; temp_b = (raw_b * 255) / raw_c;
+        final_r = saturar_valor(temp_r); final_g = saturar_valor(temp_g); final_b = saturar_valor(temp_b);
+    } else { final_r = 0; final_g = 0; final_b = 0; }
 
-    // 3. Identificar
     tag_actual = identificarTag(final_r, final_g, final_b);
-
+    
+    if (estadoActual == ESTADO_MODO_NORMAL) {
+        char txt_debug[40]; sprintf(txt_debug, "R:%03d G:%03d B:%03d   ", final_r, final_g, final_b);
+        disable_critical_irqs(); GUI_Text(10, 260, (uint8_t*)txt_debug, Black, White); enable_critical_irqs();
+    }
 		
-		if (estadoActual == ESTADO_MODO_NORMAL) {
-    char txt_debug[40];
-    sprintf(txt_debug, "R:%03d G:%03d B:%03d   ", final_r, final_g, final_b);
-    disable_critical_irqs();
-    // Escribimos abajo del todo para no molestar
-    GUI_Text(10, 260, (uint8_t*)txt_debug, Black, White); 
-    enable_critical_irqs();
-}
-		
-    // 4. Lógica de Conteo (Máquina de estados simple)
+    // --- MÁQUINA DE ESTADOS DE DETECCIÓN Y REPRODUCCIÓN ---
     if (tag_actual != 0 && flag_objeto_presente == 0) {
-        // ¡Nuevo objeto detectado!
-        flag_objeto_presente = 1; // Bloqueamos para no contar más veces este objeto
+        flag_objeto_presente = 1; 
         ultimo_tag_detectado = tag_actual;
 
-        if (tag_actual == 1) { // Rosa
+        if (tag_actual == 1) { // ROSA
             contRosa++;
-            // Aquí podrías activar servo para Rosa
+            // Reproducir Audio Rosa AUTOMÁTICAMENTE si está habilitado
+            if (audioHabilitado && estado_sistema == 0) {
+                iniciar_reproduccion_color(audio_rosa);
+            }
         } 
-        else if (tag_actual == 2) { // Verde
+        else if (tag_actual == 2) { // VERDE
             contVerde++;
-            // Aquí podrías activar servo para Verde
+            // Reproducir Audio Verde AUTOMÁTICAMENTE si está habilitado
+            if (audioHabilitado && estado_sistema == 0) {
+                iniciar_reproduccion_color(audio_verde);
+            }
         }
         
-        // Actualizar pantalla si estamos en Modo Normal
-        if (estadoActual == ESTADO_MODO_NORMAL) {
-             mostrarModoNormal(); // Refresca contadores
-        }
+        if (estadoActual == ESTADO_MODO_NORMAL) mostrarModoNormal();
     } 
     else if (tag_actual == 0) {
-        // El objeto se ha ido (o no hay nada)
         flag_objeto_presente = 0;
     }
+}
+
+/* --- INICIALIZACIÓN DE SENSORES IR --- */
+void init_IR_Sensores(void) {
+    // 1. Configurar PINSEL para que sean GPIO (00)
+    
+    LPC_PINCON->PINSEL2 &= ~((3UL << 28) | (3UL << 30)); // P1.14 y P1.15 como GPIO
+
+    // 2. Configurar la Dirección como ENTRADA (Input = 0)
+    LPC_GPIO1->FIODIR &= ~(PIN_IR_VERDE | PIN_IR_ROSA);
+
+    // 3. Configurar Resistencias Internas
+    LPC_PINCON->PINMODE2 &= ~((3UL << 28) | (3UL << 30)); 
+}
+
+/* --- FUNCIÓN PARA LEER ESTADO DE LOS SENSORES --- */
+// Retorna 1 si detecta objeto (reflexión), 0 si no.
+// NOTA: Depende del módulo, a veces D0 es LOW al detectar. 
+// Tendrás que ajustar el "!" según tus pruebas.
+uint8_t leerSensorVerde(void) {
+    // Si el módulo pone D0 a LOW (0) al detectar objeto:
+    if ( (LPC_GPIO1->FIOPIN & PIN_IR_VERDE) == 0 ) return 1; 
+    return 0;
+}
+
+uint8_t leerSensorRosa(void) {
+    if ( (LPC_GPIO1->FIOPIN & PIN_IR_ROSA) == 0 ) return 1;
+    return 0;
 }
 
 /* --- MAIN LOOP --- */
@@ -759,7 +795,8 @@ int main(void) {
     // Inicialización periféricos
     init_RTC();
     configPWM();
-    init_Externas(); 
+    init_Externas();
+		init_IR_Sensores();	
     init_ADC();      
     init_DAC();     
 		TCS34725_init();
@@ -793,14 +830,17 @@ int main(void) {
         // 1. GESTIÓN SENSORES
         if ( (ms_ticks - last_sensor_check) >= T_REFRESCO_SENSORES_MS ) {
             last_sensor_check = ms_ticks;
-            
-            check_sensores();        // Temperatura y Potenciómetro
-            procesar_sensor_color(); // rgb
-            
-            if (leer_KEY1()) { 
-                audioHabilitado = !audioHabilitado; 
-                if (estadoActual == ESTADO_MODO_NORMAL) mostrarModoNormal();
-            }
+            check_sensores();        
+            procesar_sensor_color();
+        }
+				
+				// 1.1 GESTIÓN UI AUDIO (Flag levantado por ISR)
+        if (update_audio_ui && estadoActual == ESTADO_MODO_NORMAL) {
+            disable_critical_irqs();
+            if (audioHabilitado) { GUI_Text(160, 235, (uint8_t*)"[ ON ] ", Green, White); } 
+            else { GUI_Text(160, 235, (uint8_t*)"[ OFF ]", Red, White); }
+            enable_critical_irqs();
+            update_audio_ui = 0; 
         }
         
         // 2. GESTIÓN TÁCTIL
