@@ -2,7 +2,7 @@
  * PROYECTO: Sistema de Control SEDA 
  * DISPOSITIVO: NXP LPC1768
  * PROFESOR: LAB SEDA
- * INTEGRACIÓN: Servos PWM (Timer0) + Lógica IR + Audio + RFID + TFT
+ * INTEGRACIÓN: Servos No Bloqueantes (CORREGIDO) + IR + Audio + RFID
  ********************************************************************************/
 
 #include <LPC17xx.H>
@@ -12,41 +12,44 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
-#include "uart.h" /* Librería RFID */
+#include "uart.h" 
 #include <TCS34725.h>
 
+/* --- DEFINICIONES DE TIMING Y PARAMETROS --- */
+#define F_cpu 100000000UL                       
+#define F_pclk (F_cpu/4)                 
 #define F_sample 8000
 #define N_muestras 12000 
 #define UMBRAL_DETECCION 40  
-
-/* --- DEFINICIONES DE TIMING --- */
 #define T_REFRESCO_SENSORES_MS  200
 #define T_REFRESCO_TOUCH_MS     50
 
-/* --- DEFINICIONES DE HARDWARE Y RELOJES --- */
-#define F_cpu 100000000UL                      
-#define F_pclk (F_cpu/4)                 
-#define F_wdclk F_pclk/4                
+
+//SERVOS
+#define T_PWM_S     15e-3
+#define TH_MIN_S    0.5e-3
+#define TH_MAX_S    2.5e-3
+// --- Variables Globales (Volatile para ISR) ---
+volatile float TH0 = 0.4e-3; 
+volatile float TH1 = 0.4e-3; 
+
+
+// Sensores IR (P1.23 y P1.24)
+#define PIN_IR_VERDE      (1 << 23) 
+#define PIN_IR_NARANJA    (1 << 24) 
+#define IR_DETECTADO      0         // Lógica inversa (0 = detectado)
+
+/* --- CONSTANTES VARIAS --- */
 #define Fpclk_pwm 25e6                  
-#define Tpwm  1e-3                      
+#define Tpwm  1e-3                       
 #define F_muestreo 50
 
 /* --- CONSTANTES RTC --- */
-#define PCRTC 9                         
-#define CLKEN 0                         
-#define RTCIF 0                         
-#define IMSEC 0                         
-#define CCALEN 4  
-
-#define PIN_IR_VERDE    (1 << 23) // P1.23
-#define PIN_IR_NARANJA     (1 << 24) // P1.24
-
-/* --- DEFINICIONES SERVOS (TIMER0) --- */
-float TH_min = 0.5e-3;
-float TH_max = 2.4e-3;
-#define T_pwm 15e-3
-#define T_PWM_MS_SERVO 20.0
-#define TIEMPO_MANIOBRA_MS  600  // Tiempo que tarda el servo en llegar a la posición
+#define PCRTC 9
+#define CLKEN 0
+#define RTCIF 0
+#define IMSEC 0
+#define CCALEN 4
 
 /* --- ESTRUCTURAS Y TIPOS --- */
 struct t_screenZone {
@@ -75,32 +78,24 @@ typedef enum {
 
 typedef enum { EDIT_NONE, EDIT_YEAR, EDIT_MONTH, EDIT_DOM, EDIT_HOUR, EDIT_MIN } t_EditParam;
 
-/* --- VARIABLES GLOBALES --- */
 
+
+/* --- VARIABLES GLOBALES --- */
 const uint8_t TAG_REF[2][3] = {
-    {132, 68, 53},  // TAG 1: NARANJA
-    {53, 122, 61}     // TAG 2: Verde clarito
+    {132, 68, 53},  // TAG 1: NARANJA (Según tu orden original)
+    {53, 122, 61}   // TAG 2: VERDE
 };
 
-// Estados de la máquina de servos
 typedef enum {
-    SERVO_IDLE,       
-    SERVO_MOVIENDO_IDA,   
-    SERVO_MOVIENDO_VUELTA 
-} t_EstadoServo;
+    COLOR_NINGUNO = 0,  // Estado inicial o reset
+    COLOR_NARANJA = 1,  // Coincide con tag 1
+    COLOR_VERDE   = 2   // Coincide con tag 2
+    // Puedes añadir más colores aquí: COLOR_ROJO = 3, etc.
+} Color_t;
 
-// Estructura de control de servo individual
-typedef struct {
-    t_EstadoServo estado;
-    uint32_t tiempo_inicio;
-    uint8_t id; // 0=Verde, 1=Naranja
-} t_ControlServo;
+volatile Color_t ultimo_color_valido = COLOR_NINGUNO;
 
-t_ControlServo servoVerde = {SERVO_IDLE, 0, 0};
-t_ControlServo servoNaranja  = {SERVO_IDLE, 0, 1};
 
-float TH0 = 0.5e-3;
-float TH1 = 0.5e-3;
 
 volatile uint8_t lcd_ocupado = 0; 
 volatile uint8_t update_audio_ui = 0;
@@ -113,56 +108,50 @@ volatile uint8_t  flag_segundo = 0;
 
 uint8_t update_screen = 0;
 uint32_t contVerde = 0, contNaranja = 0; 
-uint8_t  audioHabilitado = 0;           
+uint8_t  audioHabilitado = 0;            
 float    Temperatura = 22.0;
 
 int ultimoBrillo = -1;        
 int ultimaTemp = -1;
-int ultimoServo = -1;
+int anguloServo = 90;   
+int umbralTemperatura = 32;
+int brilloDisplay = 50;             
 float milivoltios = 0;
 float brilloTFT = 0;
 
 volatile uint32_t canal_0, canal_1;
-
 uint8_t  pressedTouchPanel = 0;
 
-int anguloServo = 90;   
-int umbralTemperatura = 32;
-int brilloDisplay = 50;            
 char texto[40];
 char texto_reloj_nuevo[40]; 
-
-// Variables Teclado
 char keypadBuffer[6]; 
 uint8_t  bufferIdx = 0;
 volatile uint8_t  flag_toggle_config = 0;
 
-/* --- VARIABLES PARA GESTIÓN RFID --- */
+/* --- VARIABLES RFID --- */
 uint8_t rfid_raw_data[5];
 char rfid_string_display[13] = "---";
 int k_rfid = 0; 
 EstadosRFID estado_rfid = ESPERA_TRAMA;
 
-/* --- VARIABLES AUDIO ---- */
+/* --- VARIABLES AUDIO --- */
 volatile uint8_t audio_verde[N_muestras];
 volatile uint8_t audio_Naranja[N_muestras];
 volatile uint8_t *ptr_audio_activo = audio_verde;
 volatile uint16_t indice_muestra;
-volatile uint8_t estado_sistema = 0; // 0=IDLE, 1=REPRODUCIENDO, 2=GRABANDO
+volatile uint8_t estado_sistema = 0; 
 volatile uint8_t grabacion_completa = 0;
 
-// Variables para la lógica de color
+// Variables sensor color
 uint16_t raw_r, raw_g, raw_b, raw_c;
 uint8_t final_r, final_g, final_b;
 uint8_t ultimo_tag_detectado = 0;
 uint8_t flag_objeto_presente = 0; 
 
-// Buffers para evitar parpadeos
+// Buffers UI
 char texto_temp_anterior[40] = "";
 char texto_brillo_anterior[40] = "";
 char texto_reloj_anterior[40] = ""; 
-
-
 
 /* --- ZONAS DE PANTALLA --- */
 struct t_screenZone zone_titulo     = { 20,  5, 200, 30, 0};
@@ -183,14 +172,13 @@ struct t_screenZone btn_brillo_dec = { 30, 145,  50, 30, 0};
 struct t_screenZone btn_brillo_inc = {170, 145,  50, 30, 0};
 struct t_screenZone btn_GoVerdeConfig = { 20, 180, 100, 40, 0};
 struct t_screenZone btn_GoNaranjaConfig  = { 130, 180, 100, 40, 0};
-
 struct t_screenZone keys[12];
 
 /* --- PROTOTIPOS --- */
 void init_ADC(void);
 void init_ADC_microfono(void);
 
-/* --- PROTECCIÓN DE PANTALLA ATÓMICA --- */
+/* --- FUNCIONES UI Y PROTECCIÓN --- */
 void disable_critical_irqs(void) {
     __disable_irq();
     lcd_ocupado = 1;
@@ -206,7 +194,7 @@ void escribirTextoDinamico(uint16_t x, uint16_t y, char* str, uint16_t colorText
 }
 
 void SysTick_config(void) {
-    SysTick->LOAD = 1000000 - 1; // 10ms
+    SysTick->LOAD = 1000000 - 1; 
     SysTick->VAL = 0;
     SysTick->CTRL = (1 << 2) | (1 << 1) | (1 << 0);
     NVIC_SetPriority(SysTick_IRQn, 3);
@@ -233,17 +221,15 @@ void SysTick_Handler(void) {
                 bloqueo_evento = 1;
             }
         }
-    } 
-    else {
+    } else {
         contador_pulsacion = 0;
         bloqueo_evento = 0;
     }
 }
 
-/* --- FUNCIONES RTC --- */
+/* --- RTC --- */
 void set_time_default(void) {
-    LPC_RTC->YEAR  = 2025;
-    LPC_RTC->MONTH = 12; LPC_RTC->DOM = 22;
+    LPC_RTC->YEAR  = 2025; LPC_RTC->MONTH = 12; LPC_RTC->DOM = 22;
     LPC_RTC->HOUR  = 10;   LPC_RTC->MIN   = 0;  LPC_RTC->SEC = 0;
 }
 
@@ -278,7 +264,7 @@ void actualizarRelojPantalla(uint16_t x, uint16_t y, uint16_t colorTexto) {
 
 void actualizarParametroRTC(void) {
     int valor = atoi(keypadBuffer);
-    LPC_RTC->CCR &= ~(1 << CLKEN);
+		LPC_RTC->CCR &= ~(1 << CLKEN);
     if (parametroAEditar == EDIT_YEAR)   { if(valor >= 2000 && valor <= 2099) LPC_RTC->YEAR = valor;}
     else if (parametroAEditar == EDIT_MONTH) { if(valor >= 1 && valor <= 12) LPC_RTC->MONTH = valor;}
     else if (parametroAEditar == EDIT_DOM)   { if(valor >= 1 && valor <= 31)    LPC_RTC->DOM = valor;}
@@ -287,7 +273,7 @@ void actualizarParametroRTC(void) {
     LPC_RTC->CCR |= (1 << CLKEN);
 }
 
-/* --- FUNCIONES GRÁFICAS --- */
+/* --- GUI FUNCTIONS --- */
 void squareButton(struct t_screenZone* zone, char * text, uint16_t textColor, uint16_t lineColor) {
     LCD_DrawLine(zone->x - 5, zone->y, zone->x + zone->size_x + 5, zone->y, lineColor);
     LCD_DrawLine(zone->x - 5, zone->y, zone->x - 5, zone->y + zone->size_y, lineColor);
@@ -316,56 +302,41 @@ int8_t zoneNewPressed(struct t_screenZone* zone) {
     return 0;
 }
 
-/* --- DIBUJO DE PANTALLAS --- */
+/* --- MENUS --- */
 void mostrarMenuPrincipal(void) {
-    disable_critical_irqs(); 
-    LCD_Clear(White); 
-    enable_critical_irqs();
-    
-    disable_critical_irqs();
-    squareButton(&zone_titulo, "MENU PRINCIPAL", Black, Red); enable_critical_irqs();
+    disable_critical_irqs(); LCD_Clear(White); enable_critical_irqs();
+    disable_critical_irqs(); squareButton(&zone_titulo, "MENU PRINCIPAL", Black, Red); enable_critical_irqs();
     disable_critical_irqs(); squareButton(&btn_GoNormal, "MODO NORMAL", Black, Red); enable_critical_irqs();
     disable_critical_irqs(); squareButton(&btn_GoConfig, "MODO CONFIGURACION", Black, Red); enable_critical_irqs();
     disable_critical_irqs(); squareButton(&btn_GoRTC, "AJUSTE FECHA/HORA", Black, Red); enable_critical_irqs();
-    
     sprintf(texto_reloj_nuevo, "%02d/%02d/%d  %02d:%02d:%02d   ", 
             LPC_RTC->DOM & 0x3F, LPC_RTC->MONTH & 0x0F, LPC_RTC->YEAR & 0x0FFF, 
             LPC_RTC->HOUR & 0x1F, LPC_RTC->MIN & 0x3F, LPC_RTC->SEC & 0x3F);
     disable_critical_irqs(); escribirTextoDinamico(20, 40, texto_reloj_nuevo, Black, White); enable_critical_irqs();
     strcpy(texto_reloj_anterior, texto_reloj_nuevo);
-    texto_temp_anterior[0] = '\0';
-    texto_brillo_anterior[0] = '\0';
 }
 
 void mostrarModoNormal(void) {
     disable_critical_irqs(); LCD_Clear(White); squareButton(&zone_titulo, "MODO NORMAL", Black, Blue); enable_critical_irqs();
-    
     texto_reloj_anterior[0] = '\0';
     sprintf(texto_reloj_nuevo, "%02d/%02d/%d  %02d:%02d:%02d   ", 
             LPC_RTC->DOM & 0x3F, LPC_RTC->MONTH & 0x0F, LPC_RTC->YEAR & 0x0FFF, 
             LPC_RTC->HOUR & 0x1F, LPC_RTC->MIN & 0x3F, LPC_RTC->SEC & 0x3F);
-    disable_critical_irqs();
-    escribirTextoDinamico(45, 40, texto_reloj_nuevo, Black, White);
+    disable_critical_irqs(); escribirTextoDinamico(45, 40, texto_reloj_nuevo, Black, White);
     LCD_DrawLine(10, 65, 230, 65, Blue);
-		sprintf(texto, "UMBRAL TEMPERATURA: %d C  ", umbralTemperatura);
-		GUI_Text(20, 75, (uint8_t*)texto, Red, White);
+    sprintf(texto, "UMBRAL TEMPERATURA: %d C  ", umbralTemperatura);
+    GUI_Text(20, 75, (uint8_t*)texto, Red, White);
     enable_critical_irqs();
     texto_temp_anterior[0] = '\0'; 
-    
-    sprintf(texto, "RFID: %s       ", rfid_string_display);
+    sprintf(texto, "RFID: %s         ", rfid_string_display);
     disable_critical_irqs(); GUI_Text(30, 115, (uint8_t*)texto, Black, White);
     LCD_DrawLine(10, 145, 230, 145, Blue);
     GUI_Text(20, 155, (uint8_t*)"OBJETOS PROCESADOS:", Blue, White); enable_critical_irqs();
-
     LCD_DrawLine(10, 145, 230, 145, Blue);
-    
     sprintf(texto, "VERDES: %d  ", contVerde);
-    disable_critical_irqs();
-    GUI_Text(40, 175, (uint8_t*)texto, Green, White); enable_critical_irqs();
-    
+    disable_critical_irqs(); GUI_Text(40, 175, (uint8_t*)texto, Green, White); enable_critical_irqs();
     sprintf(texto, "NARANJAS: %d  ", contNaranja);
     disable_critical_irqs(); GUI_Text(40, 195, (uint8_t*)texto, Orange, White); enable_critical_irqs();
-
     disable_critical_irqs();
     LCD_DrawLine(10, 225, 230, 225, Blue);
     GUI_Text(20, 235, (uint8_t*)"SISTEMA DE AUDIO:", Blue, White);
@@ -377,7 +348,6 @@ void mostrarModoNormal(void) {
 
 void mostrarSeleccionRTC(void) {
     disable_critical_irqs(); LCD_Clear(White); squareButton(&zone_titulo, "AJUSTE DE HORA", Black, Blue); enable_critical_irqs();
-    
     sprintf(texto, "ANYO:%d", LPC_RTC->YEAR & 0x0FFF);
     disable_critical_irqs(); squareButton(&btn_EditYear, texto, Black, Blue); enable_critical_irqs();
     sprintf(texto, "MES:%02d", (LPC_RTC->MONTH & 0x0F)); 
@@ -385,12 +355,10 @@ void mostrarSeleccionRTC(void) {
     sprintf(texto, "DIA:%02d", LPC_RTC->DOM & 0x3F); 
     disable_critical_irqs(); squareButton(&btn_EditDay, texto, Black, Blue); enable_critical_irqs();
     sprintf(texto, "HORA:%02d", LPC_RTC->HOUR & 0x1F); 
-    disable_critical_irqs();
-    squareButton(&btn_EditHour, texto, Black, Blue); enable_critical_irqs();
+    disable_critical_irqs(); squareButton(&btn_EditHour, texto, Black, Blue); enable_critical_irqs();
     sprintf(texto, "MIN:%02d", LPC_RTC->MIN & 0x3F); 
     disable_critical_irqs(); squareButton(&btn_EditMin, texto, Black, Blue); enable_critical_irqs();
-    disable_critical_irqs();
-    squareButton(&btn_Volver, "VOLVER", Red, Red); enable_critical_irqs();
+    disable_critical_irqs(); squareButton(&btn_Volver, "VOLVER", Red, Red); enable_critical_irqs();
 }
 
 void dibujarTeclado(void) {
@@ -409,16 +377,13 @@ void dibujarTeclado(void) {
 
 void mostrarModoConfig(void) {
     disable_critical_irqs(); LCD_Clear(White); squareButton(&zone_titulo, "CONFIG GENERAL", Black, Blue); enable_critical_irqs();
-    sprintf(texto, "Servo: %3d      ", anguloServo); 
-    disable_critical_irqs();
-    escribirTextoDinamico(zone_servo_val.x + 10, zone_servo_val.y + 7, texto, Black, White); enable_critical_irqs();
-    sprintf(texto, "Brillo: %3d%%     ", brilloDisplay); 
-    disable_critical_irqs();
-    escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto, Black, White); enable_critical_irqs();
+    sprintf(texto, "Servo: %3d       ", anguloServo); 
+    disable_critical_irqs(); escribirTextoDinamico(zone_servo_val.x + 10, zone_servo_val.y + 7, texto, Black, White); enable_critical_irqs();
+    sprintf(texto, "Brillo: %3d%%      ", brilloDisplay); 
+    disable_critical_irqs(); escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto, Black, White); enable_critical_irqs();
     strcpy(texto_brillo_anterior, texto); 
     disable_critical_irqs(); drawMinus(&btn_servo_dec, Black); drawAdd(&btn_servo_inc, Black); drawMinus(&btn_brillo_dec, Black);
     drawAdd(&btn_brillo_inc, Black); enable_critical_irqs();
-
     disable_critical_irqs();
     LCD_DrawLine(10, 175, 230, 175, Blue);
     squareButton(&btn_GoVerdeConfig, "CONF VERDE", Black, Green);
@@ -428,8 +393,7 @@ void mostrarModoConfig(void) {
 }
 
 void mostrarSubMenuColor(char* titulo, uint16_t color) {
-    disable_critical_irqs();
-    LCD_Clear(White);
+    disable_critical_irqs(); LCD_Clear(White);
     squareButton(&zone_titulo, titulo, Black, color);
     GUI_Text(20, 60, (uint8_t*)"USE BOTONES:", Black, White);
     GUI_Text(20, 90, (uint8_t*)"KEY2: GRABAR", Red, White);
@@ -439,7 +403,6 @@ void mostrarSubMenuColor(char* titulo, uint16_t color) {
 }
 
 /* --- PERIFÉRICOS --- */
-
 void configPWM(void) {
     LPC_SC->PCONP |= (1<<6);        
     LPC_PINCON->PINSEL3 |= (2<<20);
@@ -493,7 +456,7 @@ void check_sensores(void){
         ultimoBrillo = brilloDisplay;
         
         if (estadoActual == ESTADO_MODO_CONFIG) {
-            sprintf(texto_nuevo, "Brillo: %3d%%      ", brilloDisplay);
+            sprintf(texto_nuevo, "Brillo: %3d%%       ", brilloDisplay);
             if (strcmp(texto_nuevo, texto_brillo_anterior) != 0) {
                 disable_critical_irqs();
                 escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto_nuevo, Black, White);
@@ -503,7 +466,7 @@ void check_sensores(void){
         }
     }
 
-    sprintf(texto_nuevo, "Temperatura: %5.1f C      ", Temperatura);
+    sprintf(texto_nuevo, "Temperatura: %5.1f C       ", Temperatura);
     if (estadoActual == ESTADO_MODO_NORMAL) {
         if (strcmp(texto_nuevo, texto_temp_anterior) != 0) {
             disable_critical_irqs();
@@ -547,16 +510,16 @@ void TIMER2_IRQHandler(void) {
     LPC_ADC->ADCR = (LPC_ADC->ADCR & 0xFFFFFF00) | (1 << 0) | (1 << 24);
 }
 
-void ADC_IRQHandler(void) {    
+void ADC_IRQHandler(void) {     
     uint32_t stat = LPC_ADC->ADSTAT;
     if (stat & (1 << 2)) {
         uint8_t valor_audio = (LPC_ADC->ADDR2 >> 8) & 0xFF;
         ptr_audio_activo[indice_muestra++] = valor_audio;
         if (indice_muestra >= N_muestras) {
             LPC_TIM1->TCR = 0x02;
-            estado_sistema = 0;      
-            grabacion_completa = 1;  
-            indice_muestra = 0;      
+            estado_sistema = 0;       
+            grabacion_completa = 1;   
+            indice_muestra = 0;       
             init_ADC();       
             LPC_TIM2->TCR = 0x01;
         }
@@ -576,84 +539,118 @@ void init_TIMER2(void) {
     NVIC_EnableIRQ(TIMER2_IRQn); NVIC_SetPriority(TIMER2_IRQn, 5);
 }
 
-/* ---------- LOGICA SERVOS (TIMER0) ------------*/
+/* =========================================================================
+   4. GESTIÓN DE SERVOS 
+   ========================================================================= */
+
+// --- Funciones Auxiliares ---
+void delay__ms(uint32_t tiempo) {
+  uint32_t i;  
+	for (i = 0; i < (tiempo * 25000); i++);
+}
+
+// ESTA ES LA CLAVE: Función para activar/desactivar la salida al pin
+// servo: 0 o 1
+// estado: 1 (ACTIVO/PWM), 0 (INACTIVO/GPIO LOW)
+void servo_enable(uint8_t servo, uint8_t estado) {
+    if (servo == 0) { // P3.25 - MAT0.0
+        if (estado) {
+            // Conectar el Timer al Pin (PINSEL7 bits 19:18 = 10)
+            LPC_PINCON->PINSEL7 |=  (2 << 18); // Poner '10' (MAT0.0)
+        } else {
+            // Desconectar: Poner como GPIO (PINSEL7 bits 19:18 = 00)
+            LPC_PINCON->PINSEL7 &= ~(3 << 18);
+            // Asegurar que el nivel sea BAJO para que el servo no se vuelva loco
+            LPC_GPIO3->FIOCLR = (1 << 25);
+        }
+    } else if (servo == 1) { // P3.26 - MAT0.1
+        if (estado) {
+            // Conectar el Timer al Pin (PINSEL7 bits 21:20 = 10)
+            LPC_PINCON->PINSEL7 |=  (2 << 20); // Poner '10' (MAT0.1)
+        } else {
+            // Desconectar: Poner como GPIO
+            LPC_PINCON->PINSEL7 &= ~(3 << 20);
+            LPC_GPIO3->FIOCLR = (1 << 26);
+        }
+    }
+}
+
 void init_TIMER0(void) {
-    LPC_SC->PCONP |= (1 << 1);
+    LPC_SC->PCONP |= (1 << 1);          // Encender Timer0
+    
+    // Configurar pines como GPIO y salida por defecto (seguridad)
+    LPC_GPIO3->FIODIR |= (1 << 25) | (1 << 26);
+    
+    LPC_TIM0->TCR = 0x02;               // Reset
+    LPC_TIM0->PR  = 0;
 
-    LPC_TIM0->TCR = 0x02; 
-    LPC_TIM0->PR  = 0;    
-    LPC_TIM0->MR0 = F_pclk * 15e-3; 
-    LPC_TIM0->MR1 = F_pclk * 15e-3;
-    LPC_TIM0->EMR = (3 << 4) | (3 << 6); // Toggle
-    LPC_TIM0->MCR = (1 << 0) | (1 << 3); 
-    LPC_TIM0->TCR = 0x01; 
+    // MR iniciales
+    LPC_TIM0->MR0 = 10000;
+    LPC_TIM0->MR1 = 10000;
+
+    // MCR: Interrupción en MR0 y MR1. NO resetear MR en match.
+    LPC_TIM0->MCR = (1 << 0) | (1 << 3);
+
+    // EMR: Toggle mode. Esto es vital para que la señal se genere sola.
+    LPC_TIM0->EMR = (3 << 4) | (3 << 6); 
+
     NVIC_EnableIRQ(TIMER0_IRQn);
+    LPC_TIM0->TCR = 0x01;               // Start Timer
 }
 
-void TIMER0_IRQHandler(void) {
-    // Servo 1 (Verde)
-    if (LPC_TIM0->IR & (1 << 0)) { 
-        LPC_TIM0->IR |= (1 << 0);
-        if (LPC_TIM0->EMR & (1 << 0)) LPC_TIM0->MR0 = LPC_TIM0->MR0 + (TH0*F_pclk-1);
-        else LPC_TIM0->MR0 = LPC_TIM0->MR0 + ((T_pwm-TH0)*F_pclk-1);
-    }
-    // Servo 2 (Naranja)
-    if (LPC_TIM0->IR & (1 << 1)) {
-        LPC_TIM0->IR |= (1 << 1);
-        if (LPC_TIM0->EMR & (1 << 1)) LPC_TIM0->MR1 = LPC_TIM0->MR1 + (TH1*F_pclk-1);
-        else LPC_TIM0->MR1 = LPC_TIM0->MR1 + ((T_pwm-TH1)*F_pclk-1);
-    }
-}
-
-void set_th_servo(uint8_t id, float grados) {
+// Tu función de cálculo de movimiento (limpia y sin delays)
+void mover_servo(uint8_t actuador, float grados) {
     float nuevo_TH;
-		// Limitar rango por seguridad mecánica
-    if (grados < 0) grados = 0;
+	  // Saturación
+    if (grados < 0) grados = 2;
     if (grados > 180) grados = 180;
     
-    // Cálculo del tiempo en alto (Duty Cycle)
-    nuevo_TH = TH_min + (TH_max - TH_min) * (grados / 180.0f);
-    
-    // Actualizar variables globales VOLÁTILES
-    if (id == 0) TH0 = nuevo_TH;
-    else         TH1 = nuevo_TH;
+    nuevo_TH = TH_MIN_S + (TH_MAX_S - TH_MIN_S) * (grados / 180.0f);
+
+    if (actuador == 0) TH0 = nuevo_TH;
+    else               TH1 = nuevo_TH;
 }
 
-/* Máquina de estados para mover servos sin bloqueo */
-void procesar_maquina_servos(t_ControlServo *servo) {
-    switch(servo->estado) {
-        case SERVO_IDLE:
-            break;
-            
-        case SERVO_MOVIENDO_IDA:
-            // El servo va hacia 180. Esperamos 500ms.
-            if ((ms_ticks - servo->tiempo_inicio) >= 500) {
-                // Pasó el tiempo, volver a 0 (REPOSO)
-                set_th_servo(servo->id, 0); 
-                servo->tiempo_inicio = ms_ticks;
-                servo->estado = SERVO_MOVIENDO_VUELTA;
-            }
-            break;
-            
-        case SERVO_MOVIENDO_VUELTA:
-            // El servo vuelve a 0. Esperamos 500ms.
-            if ((ms_ticks - servo->tiempo_inicio) >= 500) {
-                // Movimiento terminado
-                servo->estado = SERVO_IDLE;
-            }
-            break;
+// La ISR SIEMPRE trabaja, manteniendo el "latido" del sistema
+void TIMER0_IRQHandler(void) {
+    uint32_t ir = LPC_TIM0->IR;
+
+    // Servo 0
+    if (ir & (1 << 0)) {
+        LPC_TIM0->IR = (1 << 0);
+        if (LPC_TIM0->EMR & (1 << 0)) // Si la salida está ALTA
+            LPC_TIM0->MR0 = LPC_TIM0->MR0+(uint32_t)(TH0 * F_pclk);
+        else                          // Si la salida está BAJA
+            LPC_TIM0->MR0 = LPC_TIM0->MR0+(uint32_t)((T_PWM_S - TH0) * F_pclk);
+    }
+
+    // Servo 1
+    if (ir & (1 << 1)) {
+        LPC_TIM0->IR = (1 << 1);
+        if (LPC_TIM0->EMR & (1 << 1)) 
+            LPC_TIM0->MR1 = LPC_TIM0->MR1+(uint32_t)(TH1 * F_pclk);
+        else 
+            LPC_TIM0->MR1 = LPC_TIM0->MR1+(uint32_t)((T_PWM_S - TH1) * F_pclk);
     }
 }
 
-// Función para DISPARAR la secuencia (solo da la orden inicial)
-void disparar_servo(t_ControlServo *servo) {
-    if (servo->estado == SERVO_IDLE) {
-        set_th_servo(servo->id, 180); // Mover a posición extendida
-        servo->tiempo_inicio = ms_ticks;
-        servo->estado = SERVO_MOVIENDO_IDA;
-    }
+void lanzar_servo(uint8_t actuador){
+				servo_enable(actuador, 1);    // ¡Conectamos! El servo "despierta" y va a posición
+        mover_servo(actuador, 0);     // 0 grados
+        delay_ms(1000);
+        
+        mover_servo(actuador, 2);   // 0 grados
+        delay_ms(1000);
+        
+        mover_servo(actuador, 180);     // 180 grados
+        delay_ms(1000);
+			
+				mover_servo(actuador, 2);   // 0 grados
+        delay_ms(1000);
+        
+        servo_enable(actuador, 0);    // Desconectamos. El servo se relaja.
+        delay_ms(1000);        // Esperamos un segundo con el servo "apagado"
 }
-
 /* ---------- LOGICA AUDIO ------------*/
 void iniciar_grabacion_color(volatile uint8_t *buffer_destino) {
     LPC_TIM2->TCR = 0x00;
@@ -755,94 +752,110 @@ uint8_t identificarTag(uint8_t r, uint8_t g, uint8_t b) {
     return id_detectado;
 }
 
+
 void procesar_sensor_color(void) {
-    uint32_t temp_r, temp_g, temp_b; uint8_t tag_actual;
+    // --- 1. Declaración de variables locales ---
+    uint32_t temp_r, temp_g, temp_b;
+    uint8_t tag_actual;
+    char txt_debug[40];
+
+    // --- 2. Adquisición de datos del sensor ---
     TCS34725_getRawData(&raw_r, &raw_g, &raw_b, &raw_c);
+    
+    // --- 3. Normalización y manejo de errores (división por cero) ---
     if (raw_c > 0) {
         temp_r = (raw_r * 255) / raw_c;
-        temp_g = (raw_g * 255) / raw_c; temp_b = (raw_b * 255) / raw_c;
-        final_r = saturar_valor(temp_r); final_g = saturar_valor(temp_g);
+        temp_g = (raw_g * 255) / raw_c;
+        temp_b = (raw_b * 255) / raw_c;
+        
+        final_r = saturar_valor(temp_r);
+        final_g = saturar_valor(temp_g);
         final_b = saturar_valor(temp_b);
-    } else { final_r = 0; final_g = 0; final_b = 0;
+    } else { 
+        // Si no hay luz clara, asumimos oscuridad total para evitar ruido
+        final_r = 0; 
+        final_g = 0; 
+        final_b = 0;
     }
 
+    // --- 4. Identificación del color ---
     tag_actual = identificarTag(final_r, final_g, final_b);
     
+    // --- 5. Depuración en pantalla (Solo en Modo Normal) ---
     if (estadoActual == ESTADO_MODO_NORMAL) {
-        char txt_debug[40];
-        sprintf(txt_debug, "R:%03d G:%03d B:%03d   ", final_r, final_g, final_b);
-        disable_critical_irqs(); GUI_Text(10, 260, (uint8_t*)txt_debug, Black, White); enable_critical_irqs();
+        sprintf(txt_debug, "R:%03d G:%03d B:%03d    ", final_r, final_g, final_b);
+        
+        // Sección Crítica: Protegemos el acceso al LCD si se usa en interrupciones o RTOS
+        disable_critical_irqs(); 
+        GUI_Text(10, 260, (uint8_t*)txt_debug, Black, White); 
+        enable_critical_irqs();
     }
         
+    // --- 6. Lógica de Control y Audio (Máquina de Estados Simplificada) ---
+    
+    // Detectamos un objeto VÁLIDO (tag != 0) que NO estaba presente antes (flag == 0)
     if (tag_actual != 0 && flag_objeto_presente == 0) {
-        flag_objeto_presente = 1;
+        
+        flag_objeto_presente = 1;      // Marcamos que el objeto está siendo procesado
         ultimo_tag_detectado = tag_actual;
 
-        if (tag_actual == 1) { // Naranja
+        // FILTRO ESTRICTO: Solo actuamos si es Naranja (1) o Verde (2)
+        
+        if (tag_actual == 1) { // --- CASO NARANJA ---
             contNaranja++;
+            ultimo_color_valido = COLOR_NARANJA; 
+            
+            // Verificación de seguridad antes de reproducir
             if (audioHabilitado && estado_sistema == 0) {
                 iniciar_reproduccion_color(audio_Naranja);
             }
         } 
-        else if (tag_actual == 2) { // VERDE
+        else if (tag_actual == 2) { // --- CASO VERDE ---
             contVerde++;
+            ultimo_color_valido = COLOR_VERDE;
+            
             if (audioHabilitado && estado_sistema == 0) {
                 iniciar_reproduccion_color(audio_verde);
             }
         }
-        
-        if (estadoActual == ESTADO_MODO_NORMAL) mostrarModoNormal();
+        // NOTA: Si tag_actual es 3, 4, etc., no entra en ningún 'if' y no suena nada.
+
+        // Actualizamos la interfaz gráfica si corresponde
+        if (estadoActual == ESTADO_MODO_NORMAL) {
+            mostrarModoNormal();
+        }
     } 
     else if (tag_actual == 0) {
+        // --- 7. Reset del flag ---
+        // Solo cuando el sensor deja de ver el objeto (tag 0), permitimos una nueva detección.
         flag_objeto_presente = 0;
     }
 }
 
 /* --- INICIALIZACIÓN DE SENSORES IR --- */
-void init_IR_Sensores(void) {
-    LPC_PINCON->PINSEL3 &= ~((3UL << 14) | (3UL << 16));
-    LPC_GPIO1->FIODIR &= ~(PIN_IR_VERDE | PIN_IR_NARANJA);
-    LPC_PINCON->PINMODE3 &= ~((3UL << 14) | (3UL << 16));
+void Init_Sensors_GPIO(void) {
+    // Configurar P1.23 y P1.24 como entradas (Bits 14:15 y 16:17 de PINSEL3 a 00)
+    LPC_PINCON->PINSEL3 &= ~((3 << 14) | (3 << 16)); 
+    LPC_GPIO1->FIODIR   &= ~(PIN_IR_VERDE | PIN_IR_NARANJA); // Input (0)
 }
 
-uint8_t leerSensorVerde(void) {
-    // Leemos del PUERTO 1
-    if ( (LPC_GPIO1->FIOPIN & PIN_IR_VERDE) == 0 ) {
-        return 1; // 0 = Detectado
-    }
-    return 0;
-}
 
-uint8_t leerSensorNaranja(void) {
-    // Leemos del PUERTO 1
-    if ( (LPC_GPIO1->FIOPIN & PIN_IR_NARANJA) == 0 ) {
-        return 1; // 0 = Detectado
-    }
-    return 0;
-}
 
 /* --- MAIN LOOP --- */
 int main(void) {
-		int j;
-	
+    
     LCD_Initializtion(); 
     LCD_Clear(White); 
     TP_Init(); 
     NVIC_SetPriorityGrouping(2);
     
-    // --- Configuración Pines Servos (P3.25/26) ---
-    LPC_PINCON->PINSEL7 |= (2<<18); // P3.25 -> MAT0.0
-    LPC_PINCON->PINSEL7 |= (2<<20); // P3.26 -> MAT0.1
-	
-		set_th_servo(0, 0); // Servo Verde a 0 grados
-    set_th_servo(1, 0); // Servo Naranja a 0 grados
-    
-    // --- Inicialización del Sistema ---
     init_RTC(); 
     configPWM(); 
     init_Externas(); 
-    init_IR_Sensores(); // Configura P1.23 y P1.24
-    init_TIMER0();      // Timer Servos
+    Init_Sensors_GPIO();
+    
+    init_TIMER0(); // Iniciar servos
+    
     init_ADC(); 
     init_DAC(); 
     TCS34725_init(); 
@@ -854,24 +867,14 @@ int main(void) {
     uart3_init(9600); 
     ptr_rx = buffer;
 
-   
-
     mostrarMenuPrincipal();
 
     while(1) {
-        if (estado_sistema != 0) continue;
+				int j;
+        if (estado_sistema != 0) continue; 
 
-        // 1. Mover Servos (Máquina de Estados)
-        procesar_maquina_servos(&servoVerde);
-        procesar_maquina_servos(&servoNaranja);
 
-        // 2. Disparo por Sensores (Leemos LPC_GPIO1)
-        if (leerSensorVerde())   disparar_servo(&servoVerde);
-        if (leerSensorNaranja()) disparar_servo(&servoNaranja);
-
-       
-
-        // 4. RFID
+        // 2. RFID
         switch(estado_rfid) {
             case ESPERA_TRAMA: 
                 if(rx_completa) { 
@@ -888,21 +891,21 @@ int main(void) {
                 } 
                 break;
             case EXTRAER_DATOS: 
-							if(buffer[9] == 0x00) { 
-								for(k_rfid=0; k_rfid<5; k_rfid++) 
-									rfid_raw_data[k_rfid] = buffer[3+k_rfid]; 
-										estado_rfid = ACTUALIZAR_DISPLAY; 
-							} else { 
-										ptr_rx = buffer; 
-										estado_rfid = ESPERA_TRAMA; 
-							} 
-							break;
+                if(buffer[9] == 0x00) { 
+                    for(k_rfid=0; k_rfid<5; k_rfid++) 
+                        rfid_raw_data[k_rfid] = buffer[3+k_rfid]; 
+                        estado_rfid = ACTUALIZAR_DISPLAY; 
+                } else { 
+                        ptr_rx = buffer; 
+                        estado_rfid = ESPERA_TRAMA; 
+                } 
+                break;
 
             case ACTUALIZAR_DISPLAY: 
                 sprintf(rfid_string_display, "%02X%02X%02X%02X%02X", rfid_raw_data[0], rfid_raw_data[1], rfid_raw_data[2], rfid_raw_data[3], rfid_raw_data[4]);
                 if (estadoActual == ESTADO_MODO_NORMAL) { 
                     disable_critical_irqs(); 
-                    sprintf(texto, "RFID: %s       ", rfid_string_display); 
+                    sprintf(texto, "RFID: %s         ", rfid_string_display); 
                     escribirTextoDinamico(30, 115, texto, Black, White); 
                     enable_critical_irqs(); 
                 }
@@ -911,18 +914,18 @@ int main(void) {
                 break;
         }
 
-        // 5. Check Sensores Lentos (Temp / Color)
+        // 3. Check Sensores Lentos
         if ((ms_ticks % T_REFRESCO_SENSORES_MS) == 0) { 
             check_sensores(); 
             procesar_sensor_color();
         }
         
-        // 6. Check Panel Táctil
+        // 4. Check Panel Táctil
         if ((ms_ticks % T_REFRESCO_TOUCH_MS) == 0) { 
             checkTouchPanel(); 
         }
         
-        // 7. UI Audio
+        // 5. UI Audio
         if (update_audio_ui && estadoActual == ESTADO_MODO_NORMAL) {
             disable_critical_irqs();
             if (audioHabilitado) {
@@ -934,14 +937,14 @@ int main(void) {
             update_audio_ui = 0;
         }
         
-        // 8. Reloj
+        // 6. Reloj
         if (flag_segundo) {
             flag_segundo = 0;
             if (estadoActual == ESTADO_MENU_PRINCIPAL) actualizarRelojPantalla(20, 40, Black);
             else if (estadoActual == ESTADO_MODO_NORMAL) actualizarRelojPantalla(45, 40, Black);
         }
 
-        // 9. Gestión de Menús (Táctil)
+        // 7. Gestión de Menús
         if (pressedTouchPanel) {
              switch(estadoActual) {
                 case ESTADO_MENU_PRINCIPAL:
@@ -949,11 +952,9 @@ int main(void) {
                     else if (zoneNewPressed(&btn_GoConfig)) { estadoActual = ESTADO_MODO_CONFIG; mostrarModoConfig(); }
                     else if (zoneNewPressed(&btn_GoRTC)) { estadoActual = ESTADO_AJUSTE_RTC; mostrarSeleccionRTC(); }
                     break;
-                
                 case ESTADO_MODO_NORMAL:
                     if (zoneNewPressed(&btn_Volver)) { estadoActual = ESTADO_MENU_PRINCIPAL; mostrarMenuPrincipal(); }
                     break;
-                
                 case ESTADO_AJUSTE_RTC:
                     if (zoneNewPressed(&btn_Volver)) { estadoActual = ESTADO_MENU_PRINCIPAL; mostrarMenuPrincipal(); }
                     else if (zoneNewPressed(&btn_EditYear))  { parametroAEditar = EDIT_YEAR; estadoActual = ESTADO_TECLADO; bufferIdx = 0; keypadBuffer[0] = '\0'; dibujarTeclado(); }
@@ -962,7 +963,6 @@ int main(void) {
                     else if (zoneNewPressed(&btn_EditHour))  { parametroAEditar = EDIT_HOUR; estadoActual = ESTADO_TECLADO; bufferIdx = 0; keypadBuffer[0] = '\0'; dibujarTeclado(); }
                     else if (zoneNewPressed(&btn_EditMin))   { parametroAEditar = EDIT_MIN; estadoActual = ESTADO_TECLADO; bufferIdx = 0; keypadBuffer[0] = '\0'; dibujarTeclado(); }
                     break;
-                
                 case ESTADO_TECLADO:
                     for (j = 0; j < 12; j++) {
                         if (zoneNewPressed(&keys[j])) {
@@ -973,7 +973,6 @@ int main(void) {
                         }
                     }
                     break;
-                
                 case ESTADO_MODO_CONFIG:
                     if (zoneNewPressed(&btn_Volver)) { estadoActual = ESTADO_MENU_PRINCIPAL; mostrarMenuPrincipal(); }
                     else if (zoneNewPressed(&btn_servo_dec)) { if(anguloServo > 0) anguloServo-=5; update_screen=1; }
@@ -982,20 +981,16 @@ int main(void) {
                     else if (zoneNewPressed(&btn_brillo_inc)){ if(brilloDisplay < 100) brilloDisplay+=10; update_screen=1; }
                     else if (zoneNewPressed(&btn_GoVerdeConfig)) { ptr_audio_activo = audio_verde; estadoActual = ESTADO_CONFIG_VERDE; mostrarSubMenuColor("CONF VERDE", Green); }
                     else if (zoneNewPressed(&btn_GoNaranjaConfig)) { ptr_audio_activo = audio_Naranja; estadoActual = ESTADO_CONFIG_NARANJA; mostrarSubMenuColor("CONF NARANJA", Orange); }
-                    
                     if(update_screen) {
                         LPC_PWM1->MR6 = (LPC_PWM1->MR0 * brilloDisplay) / 100; 
                         LPC_PWM1->LER |= (1<<6);
-                        sprintf(texto, "Servo: %3d       ", anguloServo); 
-                        disable_critical_irqs(); 
-                        escribirTextoDinamico(zone_servo_val.x + 10, zone_servo_val.y + 7, texto, Black, White);
-                        sprintf(texto, "Brillo: %3d%%     ", brilloDisplay); 
-                        escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto, Black, White); 
-                        enable_critical_irqs();
+                        sprintf(texto, "Servo: %3d        ", anguloServo); 
+                        disable_critical_irqs(); escribirTextoDinamico(zone_servo_val.x + 10, zone_servo_val.y + 7, texto, Black, White);
+                        sprintf(texto, "Brillo: %3d%%      ", brilloDisplay); 
+                        escribirTextoDinamico(zone_brillo_val.x + 10, zone_brillo_val.y + 7, texto, Black, White); enable_critical_irqs();
                         update_screen = 0; 
                     }
                     break;
-                
                 case ESTADO_CONFIG_VERDE:
                 case ESTADO_CONFIG_NARANJA:
                     if (zoneNewPressed(&btn_Volver)) { estadoActual = ESTADO_MODO_CONFIG; mostrarModoConfig(); }
