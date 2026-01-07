@@ -107,7 +107,10 @@ t_EstadoSistema estadoActual = ESTADO_MENU_PRINCIPAL;
 t_EditParam parametroAEditar = EDIT_NONE;
 
 volatile uint32_t ms_ticks = 0;
-volatile uint8_t  flag_segundo = 0;
+volatile uint8_t flag_segundo = 0;    
+//   VARIABLES RTC
+char reloj_str[20];                   // Buffer para guardar "HH:MM:SS"
+volatile uint8_t flag_rtc_update = 0;   // Generada por hardware (Cristal 32kHz)
 
 uint8_t update_screen = 0;
 uint32_t contVerde = 0, contNaranja = 0; 
@@ -174,7 +177,7 @@ struct t_screenZone btn_servo_inc  = {170,  75,  50, 30, 0};
 struct t_screenZone zone_brillo_val= { 20, 110, 200, 30, 0};
 struct t_screenZone btn_brillo_dec = { 30, 145,  50, 30, 0};
 struct t_screenZone btn_brillo_inc = {170, 145,  50, 30, 0};
-struct t_screenZone btn_GoVerdeConfig = { 20, 180, 100, 40, 0};
+struct t_screenZone btn_GoVerdeConfig = { 20, 180, 90, 40, 0};
 struct t_screenZone btn_GoNaranjaConfig  = { 130, 180, 100, 40, 0};
 struct t_screenZone btn_GoAlarmConfig = { 40, 230, 160, 40, 0};
 struct t_screenZone keys[12];
@@ -223,32 +226,77 @@ void SysTick_Handler(void) {
 }
 
 /* --- RTC --- */
-void set_time_default(void) {
-    LPC_RTC->YEAR  = 2025; LPC_RTC->MONTH = 12; LPC_RTC->DOM = 22;
-    LPC_RTC->HOUR  = 10;   LPC_RTC->MIN   = 0;  LPC_RTC->SEC = 0;
-}
+void set_time(void) {
+    // Deshabilitar RTC durante la configuración para evitar inconsistencias
+    LPC_RTC->CCR &= ~0x01; 
+    
+    LPC_RTC->YEAR = 2026;
+    LPC_RTC->MONTH = 1;
+    LPC_RTC->DOM  = 7;  // Día del mes
+    LPC_RTC->DOW  = 3;  // Miércoles (ejemplo)
+    LPC_RTC->HOUR = 11;
+    LPC_RTC->MIN  = 15;
+    LPC_RTC->SEC  = 0;
 
-void init_RTC(void) {
-    LPC_SC->PCONP |= (1<<9);
-    LPC_RTC->CCR  = 0x00;
-    LPC_RTC->CIIR = 0x00;
-    LPC_RTC->AMR  = 0xFF;
-    LPC_RTC->ILR  = 0x03;
-    set_time_default();
-    LPC_RTC->CCR = (1<<4);
-    LPC_RTC->CIIR = (1<<0);
-    NVIC_EnableIRQ(RTC_IRQn);
-    LPC_RTC->CCR |= (1<<0);
+    // Rehabilitar RTC
+    LPC_RTC->CCR |= 0x01; 
+}
+void init_RTC(void) {   
+    LPC_SC->PCONP |= (1 << 9);          // Power ON RTC (PCRTC)
+
+    // Comprobar si el RTC ya estaba corriendo (Backup registers)
+    // Usamos GPREG0 como "Magic Word" para saber si hubo un Reset o un Power Cycle real
+    if (LPC_RTC->GPREG0 != 0x1235) {    
+        LPC_RTC->CCR = 0x00;            // Deshabilitar todo
+        LPC_RTC->CCR = (1 << 1);        // Reset del Clock Tick Counter (CTCRST)
+        
+        set_time();                     // Configurar hora por defecto
+        
+        LPC_RTC->GPREG0 = 0x1235;       // Marcar como inicializado para el futuro
+        LPC_RTC->CCR = 0x00;            // Limpiar reset
+    }
+
+    LPC_RTC->ILR = 0xFF;                // Limpiar cualquier flag de interrupción pendiente
+    LPC_RTC->CIIR = (1 << 0);           // Interrupción por incremento de SEGUNDOS (IMSEC)
+    LPC_RTC->CCR |= (1 << 0) | (1 << 4); // Habilitar Contador (CLKEN) y Calibración (CCALEN)
+    
+    NVIC_EnableIRQ(RTC_IRQn);           // Habilitar en el NVIC
+    NVIC_SetPriority(RTC_IRQn, 3);      // Prioridad baja (no es crítica temporalmente)
 }
 
 void RTC_IRQHandler(void) {
-    LPC_RTC->ILR |= 0x01;
+    // Verificar si es interrupción por incremento (bit 0)
+    if (LPC_RTC->ILR & (1 << 0)) {
+        flag_rtc_update = 1;               // Avisar al main
+        LPC_RTC->ILR |= (1 << 0);       // Limpiar flag (RTCIF) escribiendo un 1
+    }
+}
+
+void RTC_LeerHora(void) {
+    uint32_t hora, min, sec;
+    
+    // Lectura de registros del periférico
+    hora = LPC_RTC->HOUR;
+    min  = LPC_RTC->MIN;
+    sec  = LPC_RTC->SEC;
+    
+    // Formatear string global para usar en UART o LCD
+    sprintf(reloj_str, "%02d:%02d:%02d", hora, min, sec);
 }
 
 void actualizarRelojPantalla(uint16_t x, uint16_t y, uint16_t colorTexto) {
-    sprintf(texto_reloj_nuevo, "%02d/%02d/%d  %02d:%02d:%02d   ", 
-            LPC_RTC->DOM & 0x3F, LPC_RTC->MONTH & 0x0F, LPC_RTC->YEAR & 0x0FFF, 
-            LPC_RTC->HOUR & 0x1F, LPC_RTC->MIN & 0x3F, LPC_RTC->SEC & 0x3F);
+    // Usamos CTIME0 (Hora, Min, Seg) y CTIME1 (Fecha) para lectura atómica
+    uint32_t ctime0 = LPC_RTC->CTIME0; 
+    uint32_t ctime1 = LPC_RTC->CTIME1;
+
+    sprintf(texto_reloj_nuevo, "%02d/%02d/%d  %02d:%02d:%02d    ", 
+            (ctime1 >> 0) & 0x1F,   // DOM
+            (ctime1 >> 8) & 0x0F,   // MES
+            (ctime1 >> 16) & 0xFFF, // AÑO
+            (ctime0 >> 16) & 0x1F,  // HORA
+            (ctime0 >> 8) & 0x3F,   // MIN
+            (ctime0 >> 0) & 0x3F);  // SEG
+
     if (strcmp(texto_reloj_nuevo, texto_reloj_anterior) != 0) {
         escribirTextoDinamico(x, y, texto_reloj_nuevo, colorTexto, White);
         strcpy(texto_reloj_anterior, texto_reloj_nuevo);
@@ -376,7 +424,7 @@ void mostrarModoConfig(void) {
     drawAdd(&btn_brillo_inc, Black); 
     LCD_DrawLine(10, 175, 230, 175, Blue);
     squareButton(&btn_GoVerdeConfig, "CONF VERDE", Black, Green);
-    squareButton(&btn_GoNaranjaConfig,  "CONF ROSA",  Black, Orange);
+    squareButton(&btn_GoNaranjaConfig,  "CONF NARANJA",  Black, Orange);
 		squareButton(&btn_GoAlarmConfig, "CONF ALARMA", Black, Red);
     squareButton(&btn_Volver, "VOLVER", Red, Red);
 }
@@ -990,12 +1038,15 @@ int main(void) {
         // ============================================================
         // 7. RELOJ EN PANTALLA (Cada segundo)
         // ============================================================
-        if (flag_segundo) {
-            flag_segundo = 0;
-            if (estadoActual == ESTADO_MENU_PRINCIPAL) actualizarRelojPantalla(20, 40, Black);
-            else if (estadoActual == ESTADO_MODO_NORMAL) actualizarRelojPantalla(45, 40, Black);
-        }
-
+        if (flag_rtc_update) {
+        flag_rtc_update = 0;
+        
+        // Actualizamos la hora en pantalla usando los registros del RTC
+        if (estadoActual == ESTADO_MENU_PRINCIPAL) 
+            actualizarRelojPantalla(20, 40, Black);
+        else if (estadoActual == ESTADO_MODO_NORMAL) 
+            actualizarRelojPantalla(45, 40, Black);
+				}
         // ============================================================
         // 8. GESTIÓN DE MENÚS (Navegación Táctil)
         // ============================================================
