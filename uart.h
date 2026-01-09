@@ -22,13 +22,16 @@
 #define RDA_INTERRUPT                   (2 << 1)
 #define CTI_INTERRUPT                   (6 << 1)
 
-extern char buffer[100];	// Buffer de recepci髇
-extern char *ptr_rx;	// puntero de recepci髇
-extern char rx_completa;// Flag de recepci髇 de cadena completa que se activa al recibir CR(0x0D)
-extern char *ptr_tx;			// puntero de transmisi髇
-extern char tx_completa;		// Flag de transmisi髇 de cadena completa
+extern char buffer[100];	// Buffer de recepci贸n
+extern char *ptr_rx;	// puntero de recepci贸n
+extern char rx_completa;// Flag de recepci贸n de cadena completa que se activa al recibir CR(0x0D)
+extern char *ptr_tx;			// puntero de transmisi贸n
+extern char tx_completa;		// Flag de transmisi贸n de cadena completa
 
 extern void uart3_init(int baudrate);
 extern void tx_cadena_UART3(char *ptr);
+
+extern void uart0_init(int baudrate);
+extern void tx_cadena_UART0(char *ptr);
 
 #endif /* UART_H_ */
